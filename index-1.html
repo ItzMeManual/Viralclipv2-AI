@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<title>ViralClip AI V3 — Free Edition</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0b0b0f;color:#fff}
+body{margin:0;background:linear-gradient(180deg,#11111a,#08080b);min-height:100vh}
+.wrap{max-width:720px;margin:auto;padding:18px 16px 48px}
+.card{background:#17171f;border:1px solid #2b2b36;border-radius:18px;padding:16px;margin:12px 0}
+h1{margin:0 0 4px;font-size:26px} h2{font-size:19px;margin:0 0 12px}
+.small{color:#aaa;font-size:13px;line-height:1.45}
+button,.file{width:100%;box-sizing:border-box;border:0;border-radius:14px;padding:14px 16px;margin-top:10px;font-size:16px;font-weight:700}
+button{background:#fff;color:#111} button.secondary{background:#282832;color:#fff}
+button:disabled{opacity:.45}
+input[type=file]{display:none}
+.file{display:block;background:#2b2b36;text-align:center;cursor:pointer}
+progress{width:100%;height:12px;margin-top:12px}
+video{width:100%;border-radius:14px;background:#000}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+input[type=text],textarea{width:100%;box-sizing:border-box;background:#0e0e14;color:#fff;border:1px solid #353542;border-radius:12px;padding:12px;font-size:15px}
+textarea{min-height:90px;resize:vertical}
+.badge{display:inline-block;padding:5px 8px;border-radius:9px;background:#292935;color:#ddd;font-size:12px;margin-right:5px}
+.good{color:#7df0a8}.warn{color:#ffd66b}
+#status{white-space:pre-wrap}
+canvas{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>🎬 ViralClip AI</h1>
+    <div class="small">V3 Free Edition • processing stays in your browser. No OpenAI API key.</div>
+  </div>
+
+  <div class="card">
+    <h2>1️⃣ Upload your licensed video</h2>
+    <label class="file">📱 Choose video<input id="videoFile" type="file" accept="video/*"></label>
+    <div id="fileInfo" class="small"></div>
+  </div>
+
+  <div class="card">
+    <h2>2️⃣ Find 3 highlights</h2>
+    <div class="small">The free engine looks for high-energy/loud moments and spreads them across the video. It is a local heuristic, not a cloud semantic model.</div>
+    <button id="scan" disabled>🔍 Scan & Find 3 Moments</button>
+    <progress id="prog" value="0" max="100" hidden></progress>
+    <div id="status" class="small"></div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="card">
+    <h2>🔐 Privacy</h2>
+    <div class="small">The selected video is processed in this browser. Nothing is uploaded to an AI API. Large videos can be memory-heavy on phones; use a shorter VOD or a smaller copy if your browser struggles.</div>
+  </div>
+</div>
+
+<video id="source" playsinline preload="metadata" muted></video>
+<canvas id="canvas" width="1080" height="1920"></canvas>
+
+<script>
+const $=id=>document.getElementById(id);
+let file=null, url=null, duration=0, audioCtx=null, sourceNode=null, dest=null;
+let clips=[];
+
+$("videoFile").addEventListener("change", async e=>{
+  file=e.target.files[0]; if(!file)return;
+  if(url)URL.revokeObjectURL(url);
+  url=URL.createObjectURL(file);
+  $("source").src=url;
+  await new Promise(r=>{ $("source").onloadedmetadata=r; });
+  duration=$("source").duration;
+  $("fileInfo").innerHTML=`<span class="badge">${file.name}</span><span class="badge">${Math.round(file.size/1024/1024)} MB</span><span class="badge">${duration.toFixed(0)} sec</span>`;
+  $("scan").disabled=false;
+  $("status").textContent="";
+});
+
+function pickMoments(peaks){
+  // Merge nearby peaks, then select the strongest non-overlapping 25–45 sec windows.
+  peaks.sort((a,b)=>b.score-a.score);
+  const chosen=[];
+  for(const p of peaks){
+    let start=Math.max(0,p.t-12), end=Math.min(duration,p.t+23);
+    if(end-start<20){start=Math.max(0,end-20)}
+    if(chosen.every(c=>end<c.start-12 || start>c.end+12)){
+      chosen.push({start,end,score:p.score});
+      if(chosen.length===3)break;
+    }
+  }
+  chosen.sort((a,b)=>a.start-b.start);
+  return chosen;
+}
+
+async function scanAudio(){
+  const status=$("status"), prog=$("prog"), video=$("source");
+  prog.hidden=false; prog.value=0;
+  status.textContent="Scanning the video in small chunks… keep this page open.";
+  try{
+    audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==="suspended") await audioCtx.resume();
+    if(!sourceNode) sourceNode=audioCtx.createMediaElementSource(video);
+    const analyser=audioCtx.createAnalyser();
+    analyser.fftSize=1024;
+    sourceNode.connect(analyser);
+    sourceNode.connect(audioCtx.destination);
+    const data=new Uint8Array(analyser.fftSize);
+    const vals=[];
+    const oldTime=video.currentTime;
+    video.muted=true;
+    video.currentTime=0;
+    await new Promise(r=>video.onseeked=r);
+    await video.play();
+    let lastSample=0;
+    while(video.currentTime < duration && !video.paused){
+      analyser.getByteTimeDomainData(data);
+      let sum=0;
+      for(let j=0;j<data.length;j++){const v=(data[j]-128)/128; sum+=v*v;}
+      const rms=Math.sqrt(sum/data.length);
+      const t=video.currentTime;
+      if(t-lastSample>=1.0 || vals.length===0){ vals.push({t,rms}); lastSample=t; }
+      prog.value=Math.min(95,(t/duration)*95);
+      status.textContent=`Scanning ${Math.floor(t)} / ${Math.floor(duration)} seconds…`;
+      await new Promise(r=>setTimeout(r,80));
+    }
+    video.pause();
+    video.currentTime=Math.min(oldTime,duration);
+    const sorted=vals.map(x=>x.rms).filter(Number.isFinite).sort((a,b)=>a-b);
+    const baseline=sorted[Math.floor(sorted.length*.55)]||0.01;
+    const peaks=vals.map(x=>({t:x.t,score:x.rms/Math.max(.0001,baseline)}))
+      .filter(x=>x.score>1.35);
+    clips=pickMoments(peaks);
+    if(clips.length<3){
+      // Fallback: choose the strongest separated moments, even when audio is quiet.
+      const fallback=[...vals].sort((a,b)=>b.rms-a.rms);
+      clips=pickMoments(fallback.map(x=>({t:x.t,score:x.rms/Math.max(.0001,baseline)})));
+    }
+    prog.value=100;
+    status.textContent=clips.length?`Found ${clips.length} moments locally.`:"No usable moments found. Try a shorter video.";
+    renderResults();
+  }catch(e){
+    status.textContent="The phone browser could not scan this video. Try a shorter/smaller video or Chrome.";
+    console.error(e);
+  }
+}
+
+$("scan").addEventListener("click",scanAudio);
+
+function escapeHtml(s){return s.replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
+function renderResults(){
+  const box=$("results"); box.innerHTML="";
+  clips.forEach((c,i)=>{
+    const hook=`WATCH THIS MOMENT 👀`;
+    const card=document.createElement("div");card.className="card";
+    card.innerHTML=`
+      <h2>Short ${i+1} • ${c.start.toFixed(1)}–${c.end.toFixed(1)}s</h2>
+      <span class="badge">Energy ${c.score.toFixed(1)}×</span>
+      <p class="small">Suggested hook: <b>${hook}</b></p>
+      <video id="preview${i}" controls playsinline></video>
+      <div class="row">
+        <button class="secondary" id="previewBtn${i}">▶ Preview</button>
+        <button id="exportBtn${i}">🎬 Export 9:16</button>
+      </div>
+      <label class="small">Your original commentary / caption</label>
+      <textarea id="comment${i}" placeholder="Example: This is the exact moment everything changed…"></textarea>
+      <button class="secondary" id="record${i}">🎙️ Record my commentary</button>
+      <div id="recState${i}" class="small"></div>
+      <button id="finalBtn${i}" disabled>⬇️ Download final Short</button>
+      <div id="download${i}"></div>`;
+    box.appendChild(card);
+    const pv=$(`preview${i}`); pv.src=url; pv.currentTime=c.start;
+    $(`previewBtn${i}`).onclick=()=>{pv.currentTime=c.start;pv.play(); setTimeout(()=>{if(pv.currentTime>=c.end)pv.pause()},Math.max(1000,(c.end-c.start)*1000))};
+    $(`exportBtn${i}`).onclick=()=>exportClip(i,false);
+    $(`record${i}`).onclick=()=>recordCommentary(i);
+  });
+}
+
+async function getAudioStream(){
+  audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+  if(!sourceNode) sourceNode=audioCtx.createMediaElementSource($("source"));
+  dest=dest||audioCtx.createMediaStreamDestination();
+  sourceNode.connect(dest); sourceNode.connect(audioCtx.destination);
+  return dest.stream;
+}
+
+async function exportClip(i,withVoice){
+  const c=clips[i], video=$("source"), canvas=$("canvas"), ctx=canvas.getContext("2d");
+  const stream=canvas.captureStream(30);
+  let audioStream;
+  try{audioStream=await getAudioStream(); audioStream.getAudioTracks().forEach(t=>stream.addTrack(t))}catch(e){}
+  const chunks=[], rec=new MediaRecorder(stream,{mimeType:MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")?"video/webm;codecs=vp9,opus":"video/webm"});
+  rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  const done=new Promise(r=>rec.onstop=()=>r(new Blob(chunks,{type:"video/webm"})));
+  video.muted=false; video.currentTime=c.start; await new Promise(r=>video.onseeked=r);
+  rec.start(250); await video.play();
+  const caption=$(`comment${i}`).value.trim()||"WATCH THIS MOMENT 👀";
+  const started=performance.now();
+  await new Promise(resolve=>{
+    function frame(){
+      const elapsed=(performance.now()-started)/1000;
+      if(video.paused || video.currentTime>=c.end || elapsed>(c.end-c.start)+2){video.pause();resolve();return}
+      const vw=video.videoWidth,vh=video.videoHeight;
+      ctx.fillStyle="#08080c";ctx.fillRect(0,0,1080,1920);
+      const scale=Math.min(1080/vw,1720/vh), w=vw*scale,h=vh*scale;
+      ctx.drawImage(video,(1080-w)/2,100+(1720-h)/2,w,h);
+      ctx.fillStyle="rgba(0,0,0,.75)";ctx.fillRect(50,1510,980,250);
+      ctx.fillStyle="#fff";ctx.font="bold 54px system-ui";ctx.textAlign="center";
+      wrapText(ctx,caption,540,1585,880,62);
+      ctx.font="bold 30px system-ui";ctx.fillStyle="#aaa";ctx.fillText("ViralClip AI",540,1845);
+      requestAnimationFrame(frame);
+    } frame();
+  });
+  rec.stop();
+  const blob=await done;
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`ViralClip_Short_${i+1}.webm`;
+  a.textContent="📥 Download draft";a.style.display="block";a.style.marginTop="10px";a.style.textAlign="center";a.style.color="#fff";
+  const d=$(`download${i}`);d.innerHTML="";d.appendChild(a);
+  $(`finalBtn${i}`).disabled=false;
+  $(`finalBtn${i}`).onclick=()=>{a.click()};
+}
+
+function wrapText(ctx,text,x,y,maxWidth,lineHeight){
+  const words=text.split(/\s+/);let line="";
+  for(let n=0;n<words.length;n++){
+    const test=line+words[n]+" ";
+    if(ctx.measureText(test).width>maxWidth&&n>0){ctx.fillText(line,x,y);line=words[n]+" ";y+=lineHeight}else line=test;
+  }ctx.fillText(line,x,y);
+}
+
+let recs={};
+async function recordCommentary(i){
+  const btn=$(`record${i}`), state=$(`recState${i}`);
+  if(recs[i]){recs[i].stop();return}
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    const r=new MediaRecorder(stream), chunks=[];recs[i]=r;
+    r.ondataavailable=e=>chunks.push(e.data);
+    r.onstop=()=>{
+      const blob=new Blob(chunks,{type:"audio/webm"});
+      const a=document.createElement("audio");a.controls=true;a.src=URL.createObjectURL(blob);
+      state.innerHTML="Recorded. Your voice is ready for the final edit.";state.appendChild(a);
+      stream.getTracks().forEach(t=>t.stop());recs[i]=null;btn.textContent="🎙️ Record again";
+    };
+    r.start();btn.textContent="⏹️ Stop recording";state.textContent="Recording…";
+  }catch(e){state.textContent="Microphone permission was not granted."}
+}
+</script>
+</body>
+</html>
